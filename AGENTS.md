@@ -1,7 +1,7 @@
 # AGENTS.md — battage
 
 Battery history summariser for Linux laptops. Reads upower's charge log and prints
-three lines: current charge, how long ago the battery was last at/near full, and how
+current charge when the source is unambiguous, the start of a qualifying discharge, and how
 the current charge cycle split between **awake** and **asleep** time (hours, percent
 burned, average watts). Personal tool for one ThinkPad; it is a single Python script
 with no third-party dependencies.
@@ -29,10 +29,9 @@ with no third-party dependencies.
   relative to the *current* full capacity. Batteries reporting charge instead of energy
   go through `charge_full * voltage_now`. If neither is readable, print no wattage:
   never guess one.
-- **Output shape is a contract.** Three lines, in order, `used:` / `sleep:` prefixed —
+- **Output shape is a contract.** Keep `used:` and `sleep:` lines in that order —
   humans and scripts both parse it by eye. Adding fields is fine; reordering is not.
-- `last full charge` = the latest sample at or above the threshold **while
-  discharging**. The current cycle is everything from there on (`hits[-1]` in `main`).
+- `last qualifying discharge` begins at the first sample of the latest discharging run containing a sample at or above the threshold. Charging and ambiguous intervals are reported separately.
 
 ## Testing without a battery
 

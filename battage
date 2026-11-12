@@ -1,146 +1,207 @@
 #!/usr/bin/env python3
-"""Hours since the battery was last charged to ~full and started discharging.
+# Edited with GPT-6.1 Terra; reasoning: medium.
+"""Summarize a battery discharge using upower's charge history.
 
-Reads upower's charge history (tab-separated: unixtime, percent, state) and
-reports the most recent sample that was at or above the threshold while
-discharging -- i.e. when the last full-ish charge began draining.
-
-It also splits the current charge cycle into awake vs asleep time: upower
-doesn't sample while the machine is suspended, so a jump far larger than the
-normal polling cadence is a sleep/off gap -- but only if the battery barely
-moved across it, since a busy machine can also cross a logging gap while
-burning several percent an hour. Sleep time is the sum of those gaps; the
-battery burned asleep is the net percent lost across each one.
+Sleep and awake figures are estimates based on gaps between history samples;
+they cannot distinguish suspend from shutdown or an interrupted logger.
 """
 import argparse
 import glob
+import math
 import os
-import subprocess
+import sys
 import time
 
-HISTORY_GLOB = "/var/lib/upower/history-charge-*.dat"
-DEFAULT_LEVEL = 97
+HISTORY_GLOB = '/var/lib/upower/history-charge-*.dat'
+DEFAULT_LEVEL = 94
 DEFAULT_GAP_MIN = 15
-# Above this drain rate a gap is the machine working (or a suspend that did
-# not take), not sleep -- real sleep sits at roughly 0.5-3 %/h.
 SLEEP_RATE_MAX = 5.0
-VALID_STATES = ("charging", "discharging", "fully-charged", "pending-charge")
+VALID_STATES = {'charging', 'discharging', 'fully-charged', 'pending-charge'}
 
 
 def find_history_file():
-    """Newest battery charge history in /var/lib/upower.
-
-    upower writes one history per device; Bluetooth peripherals (whose serial
-    is a MAC address, so the filename has colons) are filtered out when a
-    plainer candidate exists.
-    """
-    cands = glob.glob(HISTORY_GLOB)
-    plain = [p for p in cands if ":" not in os.path.basename(p)]
-    cands = plain or cands
-    if not cands:
-        raise SystemExit(
-            f"no upower charge history in {os.path.dirname(HISTORY_GLOB)} "
-            f"-- is upower installed and has it logged a discharge yet?"
-        )
-    return max(cands, key=os.path.getmtime)
+    candidates = glob.glob(HISTORY_GLOB)
+    plain = [p for p in candidates if ':' not in os.path.basename(p)]
+    candidates = plain or candidates
+    if not candidates:
+        raise ValueError('no upower charge history found in /var/lib/upower')
+    return max(candidates, key=os.path.getmtime)
 
 
 def read_rows(path):
     rows = []
-    with open(path) as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) != 3:
+    with open(path, encoding='utf-8') as history:
+        for line in history:
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) != 3 or parts[2] not in VALID_STATES:
                 continue
             try:
-                rows.append((int(parts[0]), float(parts[1]), parts[2]))
+                timestamp, percent = int(parts[0]), float(parts[1])
             except ValueError:
                 continue
-    # Drop the state=unknown / 0% rows upower writes around resumes and reboots:
-    # they would fake a huge drop across the gap that contains them.
-    rows = [r for r in rows if r[2] in VALID_STATES]
-    return sorted(rows)
+            if timestamp >= 0 and math.isfinite(percent) and 0 <= percent <= 100:
+                rows.append((timestamp, percent, parts[2]))
+    # Preserve file order for equal timestamps. Zero-length intervals are ignored.
+    return sorted(rows, key=lambda row: row[0])
+
+
+def find_cycle(rows, threshold):
+    """Start at the first sample of the latest qualifying discharge run.
+
+    A partial recharge ends a run. If the latest run never reaches the
+    threshold, retain the most recent qualifying run for historical context.
+    """
+    start = None
+    qualifying = None
+    for i, row in enumerate(rows):
+        if row[2] == 'discharging':
+            if start is None:
+                start = i
+            if row[1] >= threshold:
+                qualifying = start
+        else:
+            start = None
+    return qualifying
 
 
 def analyze_activity(rows, gap_s):
-    """Split adjacent-sample gaps into asleep (large, low-drain) and awake.
+    """Return sleep/awake hours and drain, plus hours outside discharge.
 
-    A gap counts as sleep only when it exceeds gap_s AND the battery drained
-    slower than SLEEP_RATE_MAX across it -- otherwise the machine was working
-    through the gap and its time is awake time. Battery burned asleep is
-    counted whenever the gap starts discharging and the level fell, even if it
-    ends on AC. Returns (sleep_hours, sleep_burned, used_hours).
+    Intervals starting on AC are excluded from battery draw averages. A rising
+    percentage during discharge is ambiguous and is also excluded.
     """
-    sleep_time = used_time = sleep_burn = 0.0
+    sleep_time = used_time = sleep_burn = used_burn = other_time = 0.0
     for a, b in zip(rows, rows[1:]):
         dt = b[0] - a[0]
+        if dt <= 0:
+            continue
         drop = a[1] - b[1]
-        rate = (drop / (dt / 3600)) if dt > 0 and drop > 0 else 0.0
+        if a[2] != 'discharging' or drop < 0:
+            other_time += dt
+            continue
+        rate = drop / (dt / 3600)
         if dt > gap_s and rate <= SLEEP_RATE_MAX:
             sleep_time += dt
-            if a[2] == "discharging" and drop > 0:
-                sleep_burn += drop
+            sleep_burn += drop
         else:
             used_time += dt
-    return sleep_time / 3600, sleep_burn, used_time / 3600
+            used_burn += drop
+    return sleep_time / 3600, sleep_burn, used_time / 3600, used_burn, other_time / 3600
 
 
-def get_current_percent():
-    for path in sorted(glob.glob("/sys/class/power_supply/BAT*/capacity")):
-        try:
-            with open(path) as f:
-                return int(float(f.read().strip().rstrip("%")))
-        except (OSError, ValueError):
-            continue
+def read_number(path, allow_zero=False):
     try:
-        out = subprocess.run(
-            ["upower", "-d"], capture_output=True, text=True, timeout=5
-        ).stdout
-        for line in out.splitlines():
-            s = line.strip()
-            if s.startswith("percentage:"):
-                return int(float(s.split(":", 1)[1].strip().rstrip("%")))
-    except Exception:
-        pass
+        with open(path, encoding='utf-8') as source:
+            value = float(source.read().strip().rstrip('%'))
+        return value if math.isfinite(value) and (value > 0 or (allow_zero and value == 0)) else None
+    except (OSError, ValueError):
+        return None
+
+
+def matched_battery(path, batteries, histories):
+    """Match device identifiers in upower's filename, or an only device."""
+    name = os.path.basename(path)
+    matches = []
+    for battery in batteries:
+        try:
+            with open(os.path.join(battery, 'model_name'), encoding='utf-8') as f:
+                model = f.read().strip()
+            with open(os.path.join(battery, 'serial_number'), encoding='utf-8') as f:
+                serial = f.read().strip()
+        except OSError:
+            continue
+        if model and serial and name.startswith('history-charge-' + model + '-') and name.endswith('-' + serial + '.dat'):
+            matches.append(battery)
+    if len(matches) == 1:
+        return matches[0]
+    if len(batteries) == 1 and len(histories) == 1:
+        return batteries[0]
     return None
+
+
+def battery_wh(battery):
+    energy = read_number(os.path.join(battery, 'energy_full'))
+    if energy is not None:
+        return energy / 1e6
+    charge = read_number(os.path.join(battery, 'charge_full'))
+    voltage = read_number(os.path.join(battery, 'voltage_now'))
+    if charge is not None and voltage is not None:
+        return charge * voltage / 1e12
+    return None
+
+
+def fmt_watts(burned, hours, wh):
+    if wh is None or hours <= 0:
+        return ''
+    return f', {burned / 100 * wh / hours:.1f} W average'
+
+
+def threshold_arg(value):
+    try:
+        number = float(value)
+        if math.isfinite(number) and 0 <= number <= 100:
+            return number
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError('threshold must be a number between 0 and 100')
+
+
+def gap_arg(value):
+    try:
+        number = float(value)
+        if math.isfinite(number) and number > 0:
+            return number
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError('gap must be a positive number of minutes')
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("-f", "--file", default=None,
-                    help="upower charge history file (default: newest in /var/lib/upower)")
-    ap.add_argument("-t", "--threshold", type=float, default=DEFAULT_LEVEL,
-                    help=f"charge level to count as full (default {DEFAULT_LEVEL})")
-    ap.add_argument("-g", "--gap", type=float, default=DEFAULT_GAP_MIN,
-                    help=f"minutes between samples above which the machine may "
-                         f"have been asleep (default {DEFAULT_GAP_MIN})")
+    ap.add_argument('-f', '--file', help='upower history file (default: newest battery history)')
+    ap.add_argument('-t', '--threshold', type=threshold_arg, default=DEFAULT_LEVEL,
+                    help=f'near-full charge percentage (default: {DEFAULT_LEVEL})')
+    ap.add_argument('-g', '--gap', type=gap_arg, default=DEFAULT_GAP_MIN,
+                    help=f'possible sleep gap in minutes (default: {DEFAULT_GAP_MIN})')
     args = ap.parse_args()
+    try:
+        path = args.file or find_history_file()
+        rows = read_rows(path)
+        if not rows:
+            raise ValueError(f'no usable samples in {path}')
+    except (OSError, ValueError) as exc:
+        ap.exit(1, f'battage: {exc}\n')
 
-    path = args.file or find_history_file()
-    rows = read_rows(path)
-    if not rows:
-        raise SystemExit(f"no usable samples in {path}")
+    # Only associate live data with an automatically selected history when
+    # the filename matches its model and serial, or both are unique.
+    batteries = sorted(glob.glob('/sys/class/power_supply/BAT*'))
+    histories = [p for p in glob.glob(HISTORY_GLOB) if ':' not in os.path.basename(p)]
+    battery = matched_battery(path, batteries, histories) if not args.file else None
+    if battery:
+        capacity = read_number(os.path.join(battery, 'capacity'), allow_zero=True)
+        if capacity is not None and capacity <= 100:
+            print(f'Your current charge is {capacity:g}%')
 
-    hits = [i for i, r in enumerate(rows)
-            if r[1] >= args.threshold and r[2] == "discharging"]
-    cycle = rows[hits[-1]:] if hits else rows
-
-    cur = get_current_percent()
-    if cur is not None:
-        print(f"Your current charge is {cur}%")
-
-    if hits:
-        t = rows[hits[-1]][0]
-        hours = (time.time() - t) / 3600
-        when = time.strftime("%a %d %b %H:%M", time.localtime(t))
-        print(f"last full charge was {hours:.1f} hours ago  ({when})")
+    start = find_cycle(rows, args.threshold)
+    cycle = rows[start:] if start is not None else rows
+    if start is not None:
+        timestamp = rows[start][0]
+        hours = (time.time() - timestamp) / 3600
+        when = time.strftime('%a %d %b %H:%M', time.localtime(timestamp))
+        print(f'last qualifying discharge began {hours:.1f} hours ago  ({when})')
     else:
-        print(f"no discharging samples at or above {args.threshold:.0f}% in {args.file}")
+        print(f'no discharging samples at or above {args.threshold:g}% in {path}; showing available history')
 
-    sleep_h, sleep_burn, used_h = analyze_activity(cycle, args.gap * 60)
-    print(f"used:  {used_h:.1f} hours")
-    print(f"sleep: {sleep_h:.1f} hours, burned {sleep_burn:.0f}% battery")
+    sleep_h, sleep_burn, used_h, used_burn, other_h = analyze_activity(cycle, args.gap * 60)
+    wh = battery_wh(battery) if battery else None
+    print(f'used:  {used_h:.1f} hours, burned {used_burn:.0f}% battery'
+          f'{fmt_watts(used_burn, used_h, wh)} (estimated)')
+    print(f'sleep: {sleep_h:.1f} hours, burned {sleep_burn:.0f}% battery'
+          f'{fmt_watts(sleep_burn, sleep_h, wh)} (estimated)')
+    last = time.strftime('%a %d %b %H:%M', time.localtime(cycle[-1][0]))
+    print(f'history ends: {last}; excluded charging/ambiguous intervals: {other_h:.1f} hours')
+    return 0
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())
