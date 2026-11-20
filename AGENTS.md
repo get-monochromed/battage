@@ -31,7 +31,7 @@ with no third-party dependencies.
   never guess one.
 - **Output shape is a contract.** Keep `used:` and `sleep:` lines in that order —
   humans and scripts both parse it by eye. Adding fields is fine; reordering is not.
-- `last qualifying discharge` begins at the first sample of the latest discharging run containing a sample at or above the threshold. Charging and ambiguous intervals are reported separately.
+- The latest discharge begins at the first observed discharging sample after external power, or after a rise of at least two percentage points indicating a missed charge. Never use the near-full threshold to ignore a more recent partial charge. Charging and ambiguous intervals are reported separately.
 
 ## Testing without a battery
 

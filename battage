@@ -16,6 +16,8 @@ HISTORY_GLOB = '/var/lib/upower/history-charge-*.dat'
 DEFAULT_LEVEL = 94
 DEFAULT_GAP_MIN = 15
 SLEEP_RATE_MAX = 5.0
+# One percentage point can be gauge rounding; a larger rise implies a charge.
+CHARGE_RISE_MIN = 2.0
 VALID_STATES = {'charging', 'discharging', 'fully-charged', 'pending-charge'}
 
 
@@ -45,23 +47,28 @@ def read_rows(path):
     return sorted(rows, key=lambda row: row[0])
 
 
-def find_cycle(rows, threshold):
-    """Start at the first sample of the latest qualifying discharge run.
+def find_cycle(rows):
+    """Return (start, end, evidence) for the latest recorded discharge run.
 
-    A partial recharge ends a run. If the latest run never reaches the
-    threshold, retain the most recent qualifying run for historical context.
+    A meaningful rise within a discharging run can reveal a charge that upower
+    missed while suspended. The first sample after it is only an upper bound
+    on unplugging time. A one-point rise may just be battery gauge noise.
     """
-    start = None
-    qualifying = None
+    start = end = None
+    evidence = None
     for i, row in enumerate(rows):
-        if row[2] == 'discharging':
-            if start is None:
-                start = i
-            if row[1] >= threshold:
-                qualifying = start
-        else:
-            start = None
-    return qualifying
+        if row[2] != 'discharging':
+            if start is not None and end is None:
+                end = i + 1  # retain transition sample for interval accounting
+            continue
+        previous = rows[i - 1] if i else None
+        if previous is None or previous[2] != 'discharging':
+            start, end = i, None
+            evidence = 'first sample' if previous is None else 'power-state transition'
+        elif row[1] - previous[1] >= CHARGE_RISE_MIN:
+            start, end = i, None
+            evidence = 'unrecorded charge'
+    return start, end, evidence
 
 
 def analyze_activity(rows, gap_s):
@@ -133,7 +140,7 @@ def battery_wh(battery):
 def fmt_watts(burned, hours, wh):
     if wh is None or hours <= 0:
         return ''
-    return f', {burned / 100 * wh / hours:.1f} W average'
+    return f', {burned / 100 * wh / hours:.1f} W avg'
 
 
 def threshold_arg(value):
@@ -160,7 +167,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('-f', '--file', help='upower history file (default: newest battery history)')
     ap.add_argument('-t', '--threshold', type=threshold_arg, default=DEFAULT_LEVEL,
-                    help=f'near-full charge percentage (default: {DEFAULT_LEVEL})')
+                    help=f'percentage used to label near-full starts (default: {DEFAULT_LEVEL}); does not select the cycle')
     ap.add_argument('-g', '--gap', type=gap_arg, default=DEFAULT_GAP_MIN,
                     help=f'possible sleep gap in minutes (default: {DEFAULT_GAP_MIN})')
     args = ap.parse_args()
@@ -180,26 +187,43 @@ def main():
     if battery:
         capacity = read_number(os.path.join(battery, 'capacity'), allow_zero=True)
         if capacity is not None and capacity <= 100:
-            print(f'Your current charge is {capacity:g}%')
+            print(f'Charge: {capacity:g}%')
 
-    start = find_cycle(rows, args.threshold)
-    cycle = rows[start:] if start is not None else rows
-    if start is not None:
-        timestamp = rows[start][0]
-        hours = (time.time() - timestamp) / 3600
-        when = time.strftime('%a %d %b %H:%M', time.localtime(timestamp))
-        print(f'last qualifying discharge began {hours:.1f} hours ago  ({when})')
-    else:
-        print(f'no discharging samples at or above {args.threshold:g}% in {path}; showing available history')
+    start, end, evidence = find_cycle(rows)
+    if start is None:
+        print('no discharge samples in history')
+        return 0
+    cycle = rows[start:end]
+    timestamp, percent, _ = rows[start]
+    hours = (time.time() - timestamp) / 3600
+    when = time.strftime('%a %d %b %H:%M', time.localtime(timestamp))
+    label = 'near-full' if percent >= args.threshold else 'partial'
+    print(f'Discharge: {percent:g}% ({label}), {hours:.1f} h ago ({when})')
+    if evidence == 'unrecorded charge':
+        print('Missed charge detected. Unplugging time uncertain.')
+    elif evidence == 'first sample':
+        print('History starts mid-discharge. Start time unknown.')
+    if end is not None:
+        print('Discharge ended. External power connected.')
 
     sleep_h, sleep_burn, used_h, used_burn, other_h = analyze_activity(cycle, args.gap * 60)
     wh = battery_wh(battery) if battery else None
-    print(f'used:  {used_h:.1f} hours, burned {used_burn:.0f}% battery'
-          f'{fmt_watts(used_burn, used_h, wh)} (estimated)')
-    print(f'sleep: {sleep_h:.1f} hours, burned {sleep_burn:.0f}% battery'
-          f'{fmt_watts(sleep_burn, sleep_h, wh)} (estimated)')
+    print(f'used:  {used_h:.1f} h, {used_burn:.0f}% drained'
+          f'{fmt_watts(used_burn, used_h, wh)} (est.)')
+    print(f'sleep: {sleep_h:.1f} h, {sleep_burn:.0f}% drained'
+          f'{fmt_watts(sleep_burn, sleep_h, wh)} (est.)')
     last = time.strftime('%a %d %b %H:%M', time.localtime(cycle[-1][0]))
-    print(f'history ends: {last}; excluded charging/ambiguous intervals: {other_h:.1f} hours')
+    print(f'History through {last}')
+    if other_h > 0:
+        print(f'Excluded: {other_h:.1f} h charging/uncertain')
+    if battery:
+        try:
+            with open(os.path.join(battery, 'status'), encoding='utf-8') as f:
+                status = f.read().strip()
+            if status in ('Charging', 'Full', 'Not charging') and rows[-1][2] == 'discharging':
+                print(f'Now: {status.lower()}. History has not caught up.')
+        except OSError:
+            pass
     return 0
 
 

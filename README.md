@@ -4,14 +4,16 @@ A standard-library Python command for summarizing Linux battery charge history r
 
 ```text
 $ battage
-Your current charge is 39%
-last qualifying discharge began 11.5 hours ago  (Sat 10 Oct 04:31)
-used:  3.2 hours, burned 28% battery, 3.9 W average (estimated)
-sleep: 8.2 hours, burned 8% battery, 0.4 W average (estimated)
-history ends: Sat 10 Oct 15:55; excluded charging/ambiguous intervals: 0.0 hours
+Charge: 39%
+Discharge: 80% (partial), 11.5 h ago (Sat 10 Oct 04:31)
+used:  3.2 h, 28% drained, 3.9 W avg (est.)
+sleep: 8.2 h, 8% drained, 0.4 W avg (est.)
+History through Sat 10 Oct 15:55
 ```
 
-The start is the first discharging sample of the most recent continuous discharging run containing a sample at or above the threshold (94% by default). If there is no qualifying run, the available history is summarized instead. A partial recharge ends a run; charging and later discharge intervals can appear in the summary after the selected start.
+The latest discharge starts with the first discharging sample after a recorded external-power state, regardless of whether it starts at 80%, 100%, or another level. Time spent plugged in at full charge is excluded. The `Discharge` line gives the first observed discharging sample, not necessarily the exact unplugging time. Short notices appear when the start is unknown, a charge was missed, or the discharge has ended. Excluded charging/uncertain time is shown only when nonzero. `est.` marks estimated figures.
+
+If charging was missed by the logger (for example, during suspend), a rise of at least 2 percentage points between discharging samples indicates an unrecorded charge and starts a new cycle at the later sample. A one-point rise may be gauge noise and does not restart the cycle. Very small unrecorded charges may therefore be missed; other gauge jumps may be mistaken for a charge. If the latest history is charging, the preceding discharge is reported as ended. A live charging status can reveal a transition newer than the history, but does not provide its time.
 
 The `used` and `sleep` figures are estimates over recorded intervals only. A discharging interval is classified as sleep when it is longer than `--gap` (15 minutes by default) and its drain is at most 5% per hour; other discharging intervals are counted as used. Long gaps may also represent shutdown, idle time, or interrupted logging, and rapid sleep drain can look like use. A discharge interval ending on AC is attributed to discharge. Intervals starting on AC and intervals with rising charge are excluded and reported separately. The final history sample can be older than the current time, so the interval totals need not equal the elapsed time since the start.
 
@@ -24,7 +26,7 @@ Live charge and wattage are shown only when the automatically selected history h
 ```text
 battage [-f FILE] [-t LEVEL] [-g MINUTES]
   -f, --file       upower charge history file
-  -t, --threshold  near-full charge percentage, 0–100 (default 94)
+  -t, --threshold  near-full label threshold, 0–100 (default 94); does not select the cycle
   -g, --gap        possible sleep gap in minutes, greater than zero (default 15)
 ```
 
